@@ -27,9 +27,9 @@ if __name__ == '__main__':
     }
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', '-m', type=str, default='IRIS2', help='name of models')
+    parser.add_argument('--model', '-m', type=str, default='IRIS', help='name of models')
     parser.add_argument('--dataset', '-d', type=str, default='Amazon_Musical_Instruments', help='name of datasets')
-    parser.add_argument('--config_files', type=str, default='configs/Amazon_Musical_Instruments.yaml', help='config files')
+    parser.add_argument('--config_files', type=str, default='IRIS/configs/Amazon_Musical_Instruments.yaml', help='config files')
 
     args, _ = parser.parse_known_args()
 

@@ -16,12 +16,13 @@ from torch import nn
 import torch.nn.functional as F
 
 from recbole.model.abstract_recommender import SequentialRecommender
-from recbole.model.IRISlayers2 import FeatureSeqEmbLayer, TransformerEncoder, VanillaAttention, IRISTransformerEncoder
+from recbole.model.IRISlayers import FeatureSeqEmbLayer, IRISTransformerEncoder, TransformerEncoder, VanillaAttention
 from recbole.model.loss import BPRLoss
 import copy
 from scipy.spatial.distance import pdist, squareform
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+import matplotlib.pyplot as plt
 
 class IRIS(SequentialRecommender):
     """
@@ -53,6 +54,7 @@ class IRIS(SequentialRecommender):
         self.loss_type = config['loss_type']
 
         self.fusion_type = config['fusion_type']
+        self.combine_type = config['combine_type']
 
         self.lamdas = config['lamdas']
         self.attribute_predictor = config['attribute_predictor']
@@ -67,23 +69,11 @@ class IRIS(SequentialRecommender):
             [copy.deepcopy(FeatureSeqEmbLayer(dataset,self.attribute_hidden_size[_],[self.selected_features[_]],self.pooling_mode,self.device)) for _
              in range(len(self.selected_features))])
 
-        # self.trm_encoder = TransformerEncoder(
-        #     n_layers=self.n_layers,
-        #     n_heads=self.n_heads,
-        #     hidden_size=self.hidden_size,
-        #     inner_size=self.inner_size,
-        #     # hidden_size=768,
-        #     # inner_size=self.inner_size,
-        #     hidden_dropout_prob=self.hidden_dropout_prob,
-        #     attn_dropout_prob=self.attn_dropout_prob,
-        #     hidden_act=self.hidden_act,
-        #     layer_norm_eps=self.layer_norm_eps
-        # )
-
         self.trm_encoder = IRISTransformerEncoder(
             n_layers=self.n_layers,
             n_heads=self.n_heads,
             hidden_size=self.hidden_size,
+            attribute_hidden_size=self.attribute_hidden_size,
             inner_size=self.inner_size,
             hidden_dropout_prob=self.hidden_dropout_prob,
             attn_dropout_prob=self.attn_dropout_prob,
@@ -92,37 +82,6 @@ class IRIS(SequentialRecommender):
             fusion_type=self.fusion_type,
             max_len=self.max_seq_length
         )
-
-########################################################################################################
-        # self.trm_encoder = TransformerEncoder(
-        #     n_layers=self.n_layers,
-        #     n_heads=self.n_heads,
-        #     hidden_size=self.hidden_size,
-        #     inner_size=self.inner_size,
-        #     hidden_dropout_prob=self.hidden_dropout_prob,
-        #     attn_dropout_prob=self.attn_dropout_prob,
-        #     hidden_act=self.hidden_act,
-        #     layer_norm_eps=self.layer_norm_eps
-        # )
-        # self.n_attributes = {}
-        # for attribute in self.selected_features:
-        #     self.n_attributes[attribute] = len(dataset.field2token_id[attribute])
-        # if self.attribute_predictor == 'MLP':
-        #     self.ap = nn.Sequential(nn.Linear(in_features=self.hidden_size,
-        #                                                out_features=self.hidden_size),
-        #                                      nn.BatchNorm1d(num_features=self.hidden_size),
-        #                                      nn.ReLU(),
-        #                                      # final logits
-        #                                      nn.Linear(in_features=self.hidden_size,
-        #                                                out_features=self.n_attributes)
-        #                                      )
-        # elif self.attribute_predictor == 'linear':
-        #     self.ap = nn.ModuleList(
-        #         [copy.deepcopy(nn.Linear(in_features=self.hidden_size, out_features=self.n_attributes[_]))
-        #          for _ in self.selected_features])
-###########################################################################################
-
-        self.concat_layer = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
@@ -169,35 +128,24 @@ class IRIS(SequentialRecommender):
         return extended_attention_mask
 
     def forward(self, item_seq, item_seq_len):  
-
+        
         device = item_seq.device   
         
         max_len = self.max_seq_length
-        if self.fusion_type == 'concat':
-            self.combine_layer = nn.Linear(self.hidden_size*(self.num_feature_field), self.hidden_size).to(device)
-        elif self.fusion_type == 'gate':
-            self.combine_layer = VanillaAttention(self.hidden_size, self.hidden_size).to(device)        
 
-        seq_outputs = []
-
+        item_emb = self.item_embedding(item_seq)
+        
         # position embedding
         position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
         position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
         position_embedding = self.position_embedding(position_ids)
-
-        item_emb = self.item_embedding(item_seq)
         
         # concatenate item_emb 
-        input_emb = item_emb
+        input_emb = item_emb 
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)      
-
-        # append item_emb
-        extended_attention_mask = self.get_attention_mask(item_seq)
-        trm_item_output = self.trm_encoder(input_emb, position_embedding, extended_attention_mask, output_all_encoded_layers=True)
-        output = trm_item_output[-1]
-        seq_output = self.gather_indexes(output, item_seq_len - 1)
-        seq_outputs.append(seq_output)
+        
+        seq_outputs = []        
 
         # append feature_embs  
         for feature_embed_layer in self.feature_embed_layer_list:
@@ -209,60 +157,78 @@ class IRIS(SequentialRecommender):
 
             # concat the sparse embedding and float embedding
             if sparse_embedding is not None:
-                feature_emb = sparse_embedding 
-                feature_emb = self.LayerNorm(feature_emb)
-                feature_emb = self.dropout(feature_emb)
-                feature_table.append(feature_emb)
-                
+                feature_emb = sparse_embedding
             if dense_embedding is not None:
-                feature_emb = dense_embedding 
-                feature_emb = self.LayerNorm(feature_emb)
-                feature_emb = self.dropout(feature_emb)
-                feature_table.append(feature_emb)
-                
-            feature_table = torch.cat(feature_table, dim=-2)
-            table_shape = feature_table.shape
-            embedding_size = table_shape[-1]
-            feature_emb = feature_table.view(table_shape[:-2] + (embedding_size,))
-            # input_concat = torch.cat((item_emb, feature_emb), -1)  # [B 1+field_num*H
-
-            feature_emb = self.concat_layer(feature_emb)
-            feature_emb = feature_emb 
-            feature_emb = self.LayerNorm(feature_emb)
-            feature_emb = self.dropout(feature_emb)
+                feature_emb = dense_embedding
 
             extended_attention_mask = self.get_attention_mask(item_seq)
-            trm_output = self.trm_encoder(feature_emb, position_embedding, extended_attention_mask, output_all_encoded_layers=True)
+            trm_output = self.trm_encoder(input_emb, feature_emb, position_embedding, extended_attention_mask, output_all_encoded_layers=True)
             output = trm_output[-1]
-            seq_output = self.gather_indexes(output, item_seq_len - 1)       
+            seq_output = self.gather_indexes(output, item_seq_len - 1)
 
             seq_outputs.append(seq_output)
 
-        ################################################################## 전체 합
-        # result = torch.sum(torch.stack(seq_outputs), dim=0) 
 
-        ################################################################## 전체 평균
-        result = torch.mean(torch.stack(seq_outputs), dim=0)
+        # ################################################################## 전체 합
+        # # result = torch.sum(torch.stack(seq_outputs), dim=0) 
 
-        ################################################################## 중앙값
-        # result,_ = torch.sort(torch.stack(seq_outputs), 0)
-        # result = result[len(result)//2]
+        # ################################################################## 전체 평균
+        # # result = torch.mean(torch.stack(seq_outputs), dim=0)
+
+        # ################################################################## 중앙값
+        # # result,_ = torch.sort(torch.stack(seq_outputs), 0)
+        # # result = result[len(result)//2]
         
-        ################################################################## min
-        # result = torch.min(torch.stack(seq_outputs), dim=0).values
+        # ################################################################## min
+        # # result = torch.min(torch.stack(seq_outputs), dim=0).values
 
-        ################################################################## max
-        # result = torch.max(torch.stack(seq_outputs), dim=0).values
+        # ################################################################## max
+        # # result = torch.max(torch.stack(seq_outputs), dim=0).values
 
-        ################################################################## gating
-        # result = torch.cat(seq_outputs, dim=-1)
-        # result,_ = self.combine_layer(result)
-
-        ################################################################ concat
-        # result = torch.cat(seq_outputs, dim=-1)
-        # result = self.combine_layer(result)
-
+        # ################################################################## gating
+        # self.combine_layer = nn.Linear(self.hidden_size*(self.num_feature_field), self.hidden_size).to(device)
+        # self.gate_sigmoid = torch.nn.Sigmoid()
+        # seq_concat = torch.cat(seq_outputs, dim=-1)
+        # gate_values = self.gate_sigmoid(self.combine_layer(seq_concat))
+        # combined_result = torch.zeros_like(seq_outputs[0])
+        # # 각 임베딩에 대해 가중치를 적용하여 합산
+        # for i, embedding in enumerate(seq_outputs):
+        #     weight = gate_values[:, :, i:i+1]  # 적절한 슬라이싱으로 가중치를 조정
+        #     combined_result += weight * embedding
+        # result = combined_result
+        # ################################################################ concat    
+        # # result = torch.cat(seq_outputs, dim=-1) #[2,1024,256] -> [1024, 512]
+        # # result = self.combine_layer(result)
+       
+        #combine_type = 'sum', 'mean', 'median', 'min', 'max', 'concat', 'gate'
+        if self.combine_type == 'sum':
+            result = torch.sum(torch.stack(seq_outputs), dim=0)
+        elif self.combine_type == 'mean':
+            result = torch.mean(torch.stack(seq_outputs), dim=0)
+        elif self.combine_type == 'median':
+            result,_ = torch.sort(torch.stack(seq_outputs), 0)
+            result = result[len(result)//2]
+        elif self.combine_type == 'min':
+            result = torch.min(torch.stack(seq_outputs), dim=0).values
+        elif self.combine_type == 'max':
+            result = torch.max(torch.stack(seq_outputs), dim=0).values
+        elif self.combine_type == 'concat':
+            self.combine_layer = nn.Linear(self.hidden_size*(self.num_feature_field), self.hidden_size).to(device)
+            result = torch.cat(seq_outputs, dim=-1) #[2,1024,256] -> [1024, 512]
+            result = self.combine_layer(result)
+        elif self.combine_type == 'gate':
+            self.combine_layer = nn.Linear(self.hidden_size*(self.num_feature_field), self.hidden_size).to(device)
+            self.gate_sigmoid = torch.nn.Sigmoid()
+            seq_concat = torch.cat(seq_outputs, dim=-1)
+            gate_values = self.gate_sigmoid(self.combine_layer(seq_concat))
+            combined_result = torch.zeros_like(seq_outputs[0])
+            # 각 임베딩에 대해 가중치를 적용하여 합산
+            for i, embedding in enumerate(seq_outputs):
+                weight = gate_values[:, :, i:i+1]  # 적절한 슬라이싱으로 가중치를 조정
+                combined_result += weight * embedding
+            result = combined_result
         return result
+
 ########################################################################################################################
 
     def calculate_loss(self, interaction):
@@ -287,37 +253,8 @@ class IRIS(SequentialRecommender):
             test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1)) #  sequence output with the transposed item embeddings to get the most simliar predicted item
             loss = self.loss_fct(logits, pos_items) # Cross-Entropy Loss
-
-            if self.attribute_predictor!='' and self.attribute_predictor!='not':
-                loss_dic = {'item_loss':loss}
-                attribute_loss_sum = 0
-                for i, a_predictor in enumerate(self.ap):
-                    attribute_logits = a_predictor(seq_output)
-                    attribute_labels = interaction.interaction[self.selected_features[i]]
-                    attribute_labels = nn.functional.one_hot(attribute_labels, num_classes=self.n_attributes[
-                        self.selected_features[i]])
-
-                    if len(attribute_labels.shape) > 2:
-                        attribute_labels = attribute_labels.sum(dim=1)
-                    attribute_labels = attribute_labels.float()
-                    attribute_loss = self.attribute_loss_fct(attribute_logits, attribute_labels)
-                    attribute_loss = torch.mean(attribute_loss[:, 1:])
-                    loss_dic[self.selected_features[i]] = attribute_loss
-                if self.num_feature_field == 1:
-                    total_loss = loss + self.lamdas[0] * attribute_loss
-                    # print('total_loss:{}\titem_loss:{}\tattribute_{}_loss:{}'.format(total_loss, loss,self.selected_features[0],attribute_loss))
-                else:
-                    for i,attribute in enumerate(self.selected_features):
-                        attribute_loss_sum += self.lamdas[i] * loss_dic[attribute]
-                    total_loss = loss + attribute_loss_sum
-                    loss_dic['total_loss'] = total_loss
-                    # s = ''
-                    # for key,value in loss_dic.items():
-                    #     s += '{}_{:.4f}\t'.format(key,value.item())
-                    # print(s)
-            else:
-                total_loss = loss
-            return total_loss
+            
+            return loss        
 
     def predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]

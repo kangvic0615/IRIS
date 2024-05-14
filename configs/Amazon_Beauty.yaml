@@ -4,7 +4,7 @@ use_gpu: True
 seed: 212
 state: INFO
 reproducibility: True
-data_path: 'dataset/'
+data_path: 'IRIS/dataset/'
 checkpoint_dir: 'saved'
 show_progress: True
 save_dataset: False
@@ -41,6 +41,7 @@ selected_features: ['categories', 'title', 'brand']
 pooling_mode: 'sum' # sum, mean, max
 loss_type: 'CE'
 fusion_type: 'concat'
+conbine_type: 'sum'
 lamdas: [5, 5, 5]
 attribute_predictor: ''
 
